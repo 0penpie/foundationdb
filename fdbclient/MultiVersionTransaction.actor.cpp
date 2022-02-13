@@ -1847,6 +1847,10 @@ MultiVersionApi::MultiVersionApi()
     externalClient(false), localClientDisabled(false), apiVersion(0), envOptionsLoaded(false), threadCount(0) {}
 
 MultiVersionApi* MultiVersionApi::api = new MultiVersionApi();
+void MultiVersionApi::resetAPI()
+{
+	api = new MultiVersionApi();
+}
 
 // ClientInfo
 void ClientInfo::loadProtocolVersion() {

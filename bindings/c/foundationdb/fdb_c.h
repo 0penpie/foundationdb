@@ -79,6 +79,7 @@ DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_network_set_option(FDBNetworkOption
                                                                 int value_length);
 
 #if FDB_API_VERSION >= 14
+DLLEXPORT void fdb_reset_network();
 DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_setup_network();
 #endif
 

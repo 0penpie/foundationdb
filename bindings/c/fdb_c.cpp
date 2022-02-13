@@ -125,6 +125,12 @@ fdb_error_t fdb_setup_network_v13(const char* localAddress) {
 	return fdb_setup_network_impl();
 }
 
+extern "C" DLLEXPORT void fdb_reset_network() {
+	g_api_version = 0;
+	g_network = NULL;
+	MultiVersionApi::resetAPI();
+}
+
 extern "C" DLLEXPORT fdb_error_t fdb_run_network() {
 	CATCH_AND_RETURN(API->runNetwork(););
 }

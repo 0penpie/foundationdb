@@ -169,29 +169,30 @@ public:
 
 	static void init(Reference<IEventFD> ev, double ioTimeout) {
 		ASSERT(!FLOW_KNOBS->DISABLE_POSIX_KERNEL_AIO);
+		gctx = new Context;
 		if (!g_network->isSimulated()) {
-			ctx.countAIOSubmit.init(LiteralStringRef("AsyncFile.CountAIOSubmit"));
-			ctx.countAIOCollect.init(LiteralStringRef("AsyncFile.CountAIOCollect"));
-			ctx.submitMetric.init(LiteralStringRef("AsyncFile.Submit"));
-			ctx.countPreSubmitTruncate.init(LiteralStringRef("AsyncFile.CountPreAIOSubmitTruncate"));
-			ctx.preSubmitTruncateBytes.init(LiteralStringRef("AsyncFile.PreAIOSubmitTruncateBytes"));
-			ctx.slowAioSubmitMetric.init(LiteralStringRef("AsyncFile.SlowAIOSubmit"));
+			gctx->countAIOSubmit.init(LiteralStringRef("AsyncFile.CountAIOSubmit"));
+			gctx->countAIOCollect.init(LiteralStringRef("AsyncFile.CountAIOCollect"));
+			gctx->submitMetric.init(LiteralStringRef("AsyncFile.Submit"));
+			gctx->countPreSubmitTruncate.init(LiteralStringRef("AsyncFile.CountPreAIOSubmitTruncate"));
+			gctx->preSubmitTruncateBytes.init(LiteralStringRef("AsyncFile.PreAIOSubmitTruncateBytes"));
+			gctx->slowAioSubmitMetric.init(LiteralStringRef("AsyncFile.SlowAIOSubmit"));
 		}
 
-		int rc = io_setup(FLOW_KNOBS->MAX_OUTSTANDING, &ctx.iocx);
+		int rc = io_setup(FLOW_KNOBS->MAX_OUTSTANDING, &gctx->iocx);
 		if (rc < 0) {
 			TraceEvent("IOSetupError").GetLastError();
 			throw io_error();
 		}
 		setTimeout(ioTimeout);
-		ctx.evfd = ev->getFD();
+		gctx->evfd = ev->getFD();
 		poll(ev);
 
 		g_network->setGlobal(INetwork::enRunCycleFunc, (flowGlobalType)&AsyncFileKAIO::launch);
 	}
 
-	static int get_eventfd() { return ctx.evfd; }
-	static void setTimeout(double ioTimeout) { ctx.setIOTimeout(ioTimeout); }
+	static int get_eventfd() { return gctx->evfd; }
+	static void setTimeout(double ioTimeout) { gctx->setIOTimeout(ioTimeout); }
 
 	virtual void addref() { ReferenceCounted<AsyncFileKAIO>::addref(); }
 	virtual void delref() { ReferenceCounted<AsyncFileKAIO>::delref(); }
@@ -250,10 +251,10 @@ public:
 #endif
 	virtual Future<Void> zeroRange(int64_t offset, int64_t length) override {
 		bool success = false;
-		if (ctx.fallocateZeroSupported) {
+		if (gctx->fallocateZeroSupported) {
 			int rc = fallocate(fd, FALLOC_FL_ZERO_RANGE, offset, length);
 			if (rc == EOPNOTSUPP) {
-				ctx.fallocateZeroSupported = false;
+				gctx->fallocateZeroSupported = false;
 			}
 			if (rc == 0) {
 				success = true;
@@ -277,7 +278,7 @@ public:
 		bool completed = false;
 		double begin = timer_monotonic();
 
-		if (ctx.fallocateSupported && size >= lastFileSize) {
+		if (gctx->fallocateSupported && size >= lastFileSize) {
 			result = fallocate(fd, 0, 0, size);
 			if (result != 0) {
 				int fallocateErrCode = errno;
@@ -288,7 +289,7 @@ public:
 				    .GetLastError();
 				if (fallocateErrCode == EOPNOTSUPP) {
 					// Mark fallocate as unsupported. Try again with truncate.
-					ctx.fallocateSupported = false;
+					gctx->fallocateSupported = false;
 				} else {
 					KAIOLogEvent(logFile, id, OpLogEntry::TRUNCATE, OpLogEntry::COMPLETE, size / 4096, result);
 					return io_error();
@@ -376,73 +377,73 @@ public:
 	}
 
 	static void launch() {
-		if (ctx.queue.size() && ctx.outstanding < FLOW_KNOBS->MAX_OUTSTANDING - FLOW_KNOBS->MIN_SUBMIT) {
-			ctx.submitMetric = true;
+		if (gctx->queue.size() && gctx->outstanding < FLOW_KNOBS->MAX_OUTSTANDING - FLOW_KNOBS->MIN_SUBMIT) {
+			gctx->submitMetric = true;
 
 			double begin = timer_monotonic();
-			if (!ctx.outstanding)
-				ctx.ioStallBegin = begin;
+			if (!gctx->outstanding)
+				gctx->ioStallBegin = begin;
 
 			IOBlock* toStart[FLOW_KNOBS->MAX_OUTSTANDING];
-			int n = std::min<size_t>(FLOW_KNOBS->MAX_OUTSTANDING - ctx.outstanding, ctx.queue.size());
+			int n = std::min<size_t>(FLOW_KNOBS->MAX_OUTSTANDING - gctx->outstanding, gctx->queue.size());
 
-			int64_t previousTruncateCount = ctx.countPreSubmitTruncate;
-			int64_t previousTruncateBytes = ctx.preSubmitTruncateBytes;
+			int64_t previousTruncateCount = gctx->countPreSubmitTruncate;
+			int64_t previousTruncateBytes = gctx->preSubmitTruncateBytes;
 			int64_t largestTruncate = 0;
 
 			for (int i = 0; i < n; i++) {
-				auto io = ctx.queue.top();
+				auto io = gctx->queue.top();
 
 				KAIOLogBlockEvent(io, OpLogEntry::LAUNCH);
 
-				ctx.queue.pop();
+				gctx->queue.pop();
 				toStart[i] = io;
 				io->startTime = now();
 
-				if (ctx.ioTimeout > 0) {
-					ctx.appendToRequestList(io);
+				if (gctx->ioTimeout > 0) {
+					gctx->appendToRequestList(io);
 				}
 
 				if (io->owner->lastFileSize != io->owner->nextFileSize) {
-					++ctx.countPreSubmitTruncate;
+					++gctx->countPreSubmitTruncate;
 					int64_t truncateSize = io->owner->nextFileSize - io->owner->lastFileSize;
 					ASSERT(truncateSize > 0);
-					ctx.preSubmitTruncateBytes += truncateSize;
+					gctx->preSubmitTruncateBytes += truncateSize;
 					largestTruncate = std::max(largestTruncate, truncateSize);
 					io->owner->truncate(io->owner->nextFileSize);
 				}
 			}
 			double truncateComplete = timer_monotonic();
-			int rc = io_submit(ctx.iocx, n, (linux_iocb**)toStart);
+			int rc = io_submit(gctx->iocx, n, (linux_iocb**)toStart);
 			double end = timer_monotonic();
 
 			if (end - begin > FLOW_KNOBS->SLOW_LOOP_CUTOFF) {
-				ctx.slowAioSubmitMetric->submitDuration = end - truncateComplete;
-				ctx.slowAioSubmitMetric->truncateDuration = truncateComplete - begin;
-				ctx.slowAioSubmitMetric->numTruncates = ctx.countPreSubmitTruncate - previousTruncateCount;
-				ctx.slowAioSubmitMetric->truncateBytes = ctx.preSubmitTruncateBytes - previousTruncateBytes;
-				ctx.slowAioSubmitMetric->largestTruncate = largestTruncate;
-				ctx.slowAioSubmitMetric->log();
+				gctx->slowAioSubmitMetric->submitDuration = end - truncateComplete;
+				gctx->slowAioSubmitMetric->truncateDuration = truncateComplete - begin;
+				gctx->slowAioSubmitMetric->numTruncates = gctx->countPreSubmitTruncate - previousTruncateCount;
+				gctx->slowAioSubmitMetric->truncateBytes = gctx->preSubmitTruncateBytes - previousTruncateBytes;
+				gctx->slowAioSubmitMetric->largestTruncate = largestTruncate;
+				gctx->slowAioSubmitMetric->log();
 
 				if (nondeterministicRandom()->random01() < end - begin) {
 					TraceEvent("SlowKAIOLaunch")
 					    .detail("IOSubmitTime", end - truncateComplete)
 					    .detail("TruncateTime", truncateComplete - begin)
-					    .detail("TruncateCount", ctx.countPreSubmitTruncate - previousTruncateCount)
-					    .detail("TruncateBytes", ctx.preSubmitTruncateBytes - previousTruncateBytes)
+					    .detail("TruncateCount", gctx->countPreSubmitTruncate - previousTruncateCount)
+					    .detail("TruncateBytes", gctx->preSubmitTruncateBytes - previousTruncateBytes)
 					    .detail("LargestTruncate", largestTruncate);
 				}
 			}
 
-			ctx.submitMetric = false;
-			++ctx.countAIOSubmit;
+			gctx->submitMetric = false;
+			++gctx->countAIOSubmit;
 
 			double elapsed = timer_monotonic() - begin;
 			g_network->networkInfo.metrics.secSquaredSubmit += elapsed * elapsed / 2;
 
-			//TraceEvent("Launched").detail("N", rc).detail("Queued", ctx.queue.size()).detail("Elapsed", elapsed).detail("Outstanding", ctx.outstanding+rc);
-			// printf("launched: %d/%d in %f us (%d outstanding; lowest prio %d)\n", rc, ctx.queue.size(), elapsed*1e6,
-			// ctx.outstanding + rc, toStart[n-1]->getTask());
+			//TraceEvent("Launched").detail("N", rc).detail("Queued", gctx->queue.size()).detail("Elapsed", elapsed).detail("Outstanding", gctx->outstanding+rc);
+			// printf("launched: %d/%d in %f us (%d outstanding; lowest prio %d)\n", rc, gctx->queue.size(), elapsed*1e6,
+			// gctx->outstanding + rc, toStart[n-1]->getTask());
 			if (rc < 0) {
 				if (errno == EAGAIN) {
 					rc = 0;
@@ -453,11 +454,11 @@ public:
 					rc = 1;
 				}
 			} else
-				ctx.outstanding += rc;
+				gctx->outstanding += rc;
 			// Any unsubmitted I/Os need to be requeued
 			for (int i = rc; i < n; i++) {
 				KAIOLogBlockEvent(toStart[i], OpLogEntry::REQUEUE);
-				ctx.queue.push(toStart[i]);
+				gctx->queue.push(toStart[i]);
 			}
 		}
 	}
@@ -616,7 +617,7 @@ private:
 			io->next = io->prev = nullptr;
 		}
 	};
-	static Context ctx;
+	static Context *gctx;
 
 	explicit AsyncFileKAIO(int fd, int flags, std::string const& filename)
 	  : fd(fd), flags(flags), filename(filename), failed(false) {
@@ -668,12 +669,12 @@ private:
 		KAIOLogBlockEvent(owner->logFile, io, OpLogEntry::START);
 
 		io->flags |= 1;
-		io->eventfd = ctx.evfd;
-		io->prio = (int64_t(g_network->getCurrentTask()) << 32) - (++ctx.opsIssued);
-		// io->prio = - (++ctx.opsIssued);
+		io->eventfd = gctx->evfd;
+		io->prio = (int64_t(g_network->getCurrentTask()) << 32) - (++gctx->opsIssued);
+		// io->prio = - (++gctx->opsIssued);
 		io->owner = Reference<AsyncFileKAIO>::addRef(owner);
 
-		ctx.queue.push(io);
+		gctx->queue.push(io);
 	}
 
 	static int openFlags(int flags) {
@@ -706,14 +707,14 @@ private:
 			int n;
 
 			loop {
-				n = io_getevents(ctx.iocx, 0, FLOW_KNOBS->MAX_OUTSTANDING, ev, &tm);
+				n = io_getevents(gctx->iocx, 0, FLOW_KNOBS->MAX_OUTSTANDING, ev, &tm);
 				if (n >= 0 || errno != EINTR)
 					break;
 			}
 
-			++ctx.countAIOCollect;
-			// printf("io_getevents: collected %d/%d in %f us (%d queued)\n", n, ctx.outstanding, (timer()-before)*1e6,
-			// ctx.queue.size());
+			++gctx->countAIOCollect;
+			// printf("io_getevents: collected %d/%d in %f us (%d queued)\n", n, gctx->outstanding, (timer()-before)*1e6,
+			// gctx->queue.size());
 			if (n < 0) {
 				// printf("io_getevents failed: %d\n", errno);
 				TraceEvent("IOGetEventsError").GetLastError();
@@ -721,18 +722,18 @@ private:
 			}
 			if (n) {
 				double t = timer_monotonic();
-				double elapsed = t - ctx.ioStallBegin;
-				ctx.ioStallBegin = t;
+				double elapsed = t - gctx->ioStallBegin;
+				gctx->ioStallBegin = t;
 				g_network->networkInfo.metrics.secSquaredDiskStall += elapsed * elapsed / 2;
 			}
 
-			ctx.outstanding -= n;
+			gctx->outstanding -= n;
 
-			if (ctx.ioTimeout > 0) {
+			if (gctx->ioTimeout > 0) {
 				double currentTime = now();
-				while (ctx.submittedRequestList && currentTime - ctx.submittedRequestList->startTime > ctx.ioTimeout) {
-					ctx.submittedRequestList->timeout(ctx.timeoutWarnOnly);
-					ctx.removeFromRequestList(ctx.submittedRequestList);
+				while (gctx->submittedRequestList && currentTime - gctx->submittedRequestList->startTime > gctx->ioTimeout) {
+					gctx->submittedRequestList->timeout(gctx->timeoutWarnOnly);
+					gctx->removeFromRequestList(gctx->submittedRequestList);
 				}
 			}
 
@@ -741,8 +742,8 @@ private:
 
 				KAIOLogBlockEvent(iob, OpLogEntry::COMPLETE, ev[i].result);
 
-				if (ctx.ioTimeout > 0) {
-					ctx.removeFromRequestList(iob);
+				if (gctx->ioTimeout > 0) {
+					gctx->removeFromRequestList(iob);
 				}
 
 				iob->setResult(ev[i].result);
@@ -899,7 +900,7 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/RequestList") {
 	return Void();
 }
 
-AsyncFileKAIO::Context AsyncFileKAIO::ctx;
+AsyncFileKAIO::Context* AsyncFileKAIO::gctx;
 
 #include "flow/unactorcompiler.h"
 #endif

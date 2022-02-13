@@ -544,6 +544,7 @@ public:
 	// Creates an IDatabase object that represents a connection to the cluster
 	Reference<IDatabase> createDatabase(const char* clusterFilePath) override;
 	static MultiVersionApi* api;
+	static void resetAPI();
 
 	Reference<ClientInfo> getLocalClient();
 	void runOnExternalClients(int threadId,
